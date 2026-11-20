@@ -35,10 +35,28 @@ pnpm build:mac  # unsigned macOS bundle (electron-builder)
 
 Requires `kubectl` on PATH and a reachable cluster context.
 
+## Pro tier
+
+v0.2.0 adds a license gate for write operations and port-forward.
+
+- **Free**: all browsing, describe, logs — read-only
+- **Pro**: rollout restart, scale, delete (UI-confirm required),
+  kubectl port-forward for services
+
+Licensing uses self-signed Ed25519 keys — verification is fully
+offline; the public key is embedded in `src/main/license.ts`.
+Generate a key:
+
+```bash
+node scripts/generate-license.mjs user@example.com [expiry]
+```
+
+`license-private.pem` lives in the repo root, is gitignored, and is
+the only secret — never commit it. Dev override: `K8S_DESKTOP_PRO=1`.
+
 ## Roadmap candidates (not implemented)
 
-- Write operations behind explicit confirmation (restart, scale, delete)
 - exec/shell into containers (needs WebSocket + xterm.js)
-- YAML editor view, port-forward, multi-cluster compare
+- YAML editor view, multi-cluster compare
 - Signed/notarized builds + auto-update for distribution
-- License gating for a Pro tier
+- Paddle webhook → auto-issue license keys on purchase
