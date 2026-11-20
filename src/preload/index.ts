@@ -23,7 +23,34 @@ const api = {
     namespace?: string
     kind: string
     name: string
-  }): Promise<string> => ipcRenderer.invoke('k8s:describe', args)
+  }): Promise<string> => ipcRenderer.invoke('k8s:describe', args),
+
+  // Pro
+  proStatus: (): Promise<{
+    pro: boolean
+    key?: string
+    email?: string
+    expiresAt?: string
+    error?: string
+  }> => ipcRenderer.invoke('pro:status'),
+  proActivate: (key: string) => ipcRenderer.invoke('pro:activate', key),
+  proDeactivate: (): Promise<void> => ipcRenderer.invoke('pro:deactivate'),
+  rolloutRestart: (args: { context: string; namespace: string; name: string }) =>
+    ipcRenderer.invoke('pro:rolloutRestart', args),
+  scale: (args: { context: string; namespace: string; name: string; replicas: number }) =>
+    ipcRenderer.invoke('pro:scale', args),
+  deleteResource: (args: { context: string; namespace?: string; kind: string; name: string }) =>
+    ipcRenderer.invoke('pro:delete', args),
+  portForwardStart: (args: {
+    context: string
+    namespace: string
+    target: string
+    localPort: number
+    remotePort: number
+  }): Promise<{ id: number; spec: string }> => ipcRenderer.invoke('pro:portForwardStart', args),
+  portForwardStop: (id: number): Promise<boolean> => ipcRenderer.invoke('pro:portForwardStop', id),
+  portForwardList: (): Promise<{ id: number; spec: string; localPort: number }[]> =>
+    ipcRenderer.invoke('pro:portForwardList')
 }
 
 export type K8sApi = typeof api

@@ -109,6 +109,19 @@ function friendlyError(raw: string): string {
   return lines.slice(-4).join('\n') || raw
 }
 
+interface LicenseState {
+  pro: boolean
+  key?: string
+  email?: string
+  expiresAt?: string
+}
+
+interface Forward {
+  id: number
+  spec: string
+  localPort: number
+}
+
 export default function App(): React.JSX.Element {
   const [contexts, setContexts] = useState<string[]>([])
   const [context, setContext] = useState('')
@@ -125,6 +138,14 @@ export default function App(): React.JSX.Element {
   const [logPrevious, setLogPrevious] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [license, setLicense] = useState<LicenseState>({ pro: false })
+  const [showLicense, setShowLicense] = useState(false)
+  const [licenseKey, setLicenseKey] = useState('')
+  const [licenseErr, setLicenseErr] = useState('')
+  const [forwards, setForwards] = useState<Forward[]>([])
+  const [pfLocal, setPfLocal] = useState('')
+  const [pfRemote, setPfRemote] = useState('')
+  const [actionMsg, setActionMsg] = useState('')
 
   useEffect(() => {
     window.k8s
@@ -135,7 +156,26 @@ export default function App(): React.JSX.Element {
         setContext(cur || ctxs[0] || '')
       })
       .catch((e) => setError(`Cannot reach kubectl: ${friendlyError(String(e))}`))
+    window.k8s
+      .proStatus()
+      .then(setLicense)
+      .catch(() => undefined)
+    window.k8s
+      .portForwardList()
+      .then(setForwards)
+      .catch(() => undefined)
   }, [])
+
+  async function runProAction(fn: () => Promise<unknown>, ok: string): Promise<void> {
+    setActionMsg('')
+    try {
+      const out = await fn()
+      setActionMsg(typeof out === 'string' && out.trim() ? out.trim() : ok)
+      loadResources()
+    } catch (e) {
+      setActionMsg(`Error: ${friendlyError(String(e))}`)
+    }
+  }
 
   useEffect(() => {
     if (!context) return
@@ -259,7 +299,12 @@ export default function App(): React.JSX.Element {
             </button>
           ))}
         </nav>
-        <div className="sidebar-foot">Read-only MVP · uses your kubeconfig via kubectl</div>
+        <button className="pro-btn" onClick={() => setShowLicense(true)}>
+          {license.pro ? `Pro ✓ ${license.email ?? ''}` : 'Unlock Pro'}
+        </button>
+        <div className="sidebar-foot">
+          Free: read-only browsing · Pro: actions &amp; port-forward
+        </div>
       </aside>
 
       <main className="main">
@@ -395,8 +440,200 @@ export default function App(): React.JSX.Element {
               ×
             </button>
           </header>
+
+          {/* Pro actions */}
+          <div className="actions-bar">
+            {kind === 'deployments' && (
+              <>
+                <button
+                  disabled={!license.pro}
+                  title={license.pro ? '' : 'Pro feature'}
+                  onClick={() => {
+                    if (confirm(`Restart deployment ${selected.metadata.name}?`)) {
+                      runProAction(
+                        () =>
+                          window.k8s.rolloutRestart({
+                            context,
+                            namespace: selected.metadata.namespace ?? namespace,
+                            name: selected.metadata.name
+                          }),
+                        'Rollout restarted'
+                      )
+                    }
+                  }}
+                >
+                  Restart
+                </button>
+                <button
+                  disabled={!license.pro}
+                  title={license.pro ? '' : 'Pro feature'}
+                  onClick={() => {
+                    const n = prompt(
+                      `Replicas for ${selected.metadata.name}?`,
+                      String(selected.status?.replicas ?? 1)
+                    )
+                    if (n === null) return
+                    runProAction(
+                      () =>
+                        window.k8s.scale({
+                          context,
+                          namespace: selected.metadata.namespace ?? namespace,
+                          name: selected.metadata.name,
+                          replicas: Number(n)
+                        }),
+                      'Scaled'
+                    )
+                  }}
+                >
+                  Scale
+                </button>
+              </>
+            )}
+            {kind === 'services' && (
+              <div className="pf">
+                <input
+                  placeholder="local"
+                  value={pfLocal}
+                  onChange={(e) => setPfLocal(e.target.value.replace(/\D/g, ''))}
+                />
+                <span>→</span>
+                <input
+                  placeholder="remote"
+                  value={pfRemote}
+                  onChange={(e) => setPfRemote(e.target.value.replace(/\D/g, ''))}
+                />
+                <button
+                  disabled={!license.pro || !pfLocal || !pfRemote}
+                  title={license.pro ? '' : 'Pro feature'}
+                  onClick={() =>
+                    runProAction(
+                      () =>
+                        window.k8s
+                          .portForwardStart({
+                            context,
+                            namespace: selected.metadata.namespace ?? namespace,
+                            target: `svc/${selected.metadata.name}`,
+                            localPort: Number(pfLocal),
+                            remotePort: Number(pfRemote)
+                          })
+                          .then(async (r) => {
+                            setForwards(await window.k8s.portForwardList())
+                            return r.spec
+                          }),
+                      'Forward started'
+                    )
+                  }
+                >
+                  Forward
+                </button>
+              </div>
+            )}
+            <button
+              className="danger"
+              disabled={!license.pro}
+              title={license.pro ? '' : 'Pro feature'}
+              onClick={() => {
+                if (confirm(`Delete ${kind} ${selected.metadata.name}? This cannot be undone.`)) {
+                  runProAction(
+                    () =>
+                      window.k8s.deleteResource({
+                        context,
+                        namespace: selected.metadata.namespace,
+                        kind,
+                        name: selected.metadata.name
+                      }),
+                    'Deleted'
+                  )
+                }
+              }}
+            >
+              Delete
+            </button>
+          </div>
+          {actionMsg && <div className="action-msg">{actionMsg}</div>}
+
+          {forwards.length > 0 && kind === 'services' && (
+            <div className="forwards">
+              <p className="lbl">Active port-forwards</p>
+              {forwards.map((f) => (
+                <div key={f.id} className="forward-row">
+                  <span className="mono">{f.spec}</span>
+                  <button
+                    disabled={!license.pro}
+                    onClick={() =>
+                      window.k8s
+                        .portForwardStop(f.id)
+                        .then(() => window.k8s.portForwardList())
+                        .then(setForwards)
+                    }
+                  >
+                    Stop
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
           <pre className="detail-body">{detail}</pre>
         </section>
+      )}
+
+      {/* License modal */}
+      {showLicense && (
+        <div className="modal-bg" onClick={() => setShowLicense(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2>K8s Desktop Pro</h2>
+            {license.pro ? (
+              <>
+                <p className="muted">
+                  Active{license.email ? ` · ${license.email}` : ''}
+                  {license.expiresAt ? ` · expires ${license.expiresAt}` : ''}
+                </p>
+                <button
+                  className="danger"
+                  onClick={async () => {
+                    await window.k8s.proDeactivate()
+                    setLicense({ pro: false })
+                  }}
+                >
+                  Deactivate license
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="muted">
+                  Paste your license key to unlock actions and port-forward. Get a key from the
+                  DevOps Toolkit store.
+                </p>
+                <input
+                  className="license-input"
+                  placeholder="XXXX-XXXX-XXXX-XXXX"
+                  value={licenseKey}
+                  onChange={(e) => setLicenseKey(e.target.value)}
+                />
+                {licenseErr && <p className="error-text">{licenseErr}</p>}
+                <div className="modal-actions">
+                  <button
+                    className="refresh"
+                    onClick={async () => {
+                      setLicenseErr('')
+                      const s = await window.k8s.proActivate(licenseKey)
+                      if (s.pro) {
+                        setLicense(s)
+                        setShowLicense(false)
+                      } else {
+                        setLicenseErr(s.error ?? 'Invalid key')
+                      }
+                    }}
+                  >
+                    Activate
+                  </button>
+                  <button onClick={() => setShowLicense(false)}>Cancel</button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
       )}
     </div>
   )
