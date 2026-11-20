@@ -65,9 +65,10 @@ function verifyKey(key: string): { email?: string; expiresAt?: string } | null {
       type: 'spki'
     })
     if (!verify(null, Buffer.from(payloadB64), pub, sig)) return null
-    const data = JSON.parse(
-      Buffer.from(payloadB64, 'base64url').toString('utf8')
-    ) as { email?: string; exp?: string }
+    const data = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as {
+      email?: string
+      exp?: string
+    }
     if (data.exp && new Date(data.exp).getTime() < Date.now()) return null
     return { email: data.email, expiresAt: data.exp }
   } catch {
