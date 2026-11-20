@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
+interface ContainerStatus {
+  name?: string
+  ready?: boolean
+  restartCount?: number
+  state?: {
+    waiting?: { reason?: string; message?: string }
+    terminated?: { reason?: string; exitCode?: number }
+    running?: unknown
+  }
+}
+
 interface K8sObject {
   metadata: {
     name: string
@@ -8,7 +19,10 @@ interface K8sObject {
     labels?: Record<string, string>
   }
   status?: Record<string, unknown>
-  spec?: Record<string, unknown>
+  spec?: {
+    containers?: { name?: string }[]
+    [key: string]: unknown
+  }
 }
 
 interface K8sList {
@@ -26,12 +40,30 @@ const KINDS = [
   { id: 'events', label: 'Events' }
 ]
 
+const CLUSTER_SCOPED = new Set(['nodes', 'namespaces'])
+
+function waitingReason(item: K8sObject): string | null {
+  const cs = item.status?.containerStatuses as ContainerStatus[] | undefined
+  for (const c of cs ?? []) {
+    const r = c.state?.waiting?.reason
+    if (r) return r
+  }
+  for (const c of cs ?? []) {
+    const t = c.state?.terminated
+    if (t?.reason && t.reason !== 'Completed') return t.reason
+  }
+  return null
+}
+
 function podStatus(item: K8sObject): string {
-  if (item.status?.phase) return String(item.status.phase)
-  const cs = item.status?.containerStatuses as { ready?: boolean }[] | undefined
+  const waiting = waitingReason(item)
+  if (waiting) return waiting
+  const phase = item.status?.phase
+  if (phase && phase !== 'Running') return String(phase)
+  const cs = item.status?.containerStatuses as ContainerStatus[] | undefined
   if (cs) {
     const ready = cs.filter((c) => c.ready).length
-    return `${ready}/${cs.length}`
+    return `${ready}/${cs.length} ${phase ?? ''}`.trim()
   }
   const ready = item.status?.readyReplicas
   const total = item.status?.replicas
@@ -39,13 +71,26 @@ function podStatus(item: K8sObject): string {
   const conds = item.status?.conditions as { type?: string; status?: string }[] | undefined
   const readyCond = conds?.find((c) => c.type === 'Ready')
   if (readyCond) return readyCond.status === 'True' ? 'Ready' : 'NotReady'
-  return '—'
+  return String(phase ?? '—')
+}
+
+function restartCount(item: K8sObject): number {
+  const cs = item.status?.containerStatuses as ContainerStatus[] | undefined
+  return (cs ?? []).reduce((n, c) => n + (c.restartCount ?? 0), 0)
+}
+
+function containerNames(item: K8sObject): string[] {
+  const fromSpec = (item.spec?.containers ?? []).map((c) => c.name).filter(Boolean) as string[]
+  if (fromSpec.length) return fromSpec
+  const cs = item.status?.containerStatuses as ContainerStatus[] | undefined
+  return (cs ?? []).map((c) => c.name).filter(Boolean) as string[]
 }
 
 function statusClass(s: string): string {
-  if (/Running|Ready|Active|Bound|^(\d+)\/\1$/.test(s)) return 'ok'
-  if (/Pending|ContainerCreating|Progressing/.test(s)) return 'warn'
-  if (/Failed|Error|CrashLoop|BackOff|NotReady|Unknown/.test(s)) return 'bad'
+  if (/Failed|Error|CrashLoop|BackOff|OOMKill|NotReady|Unknown|ImagePull|Evicted/.test(s))
+    return 'bad'
+  if (/Pending|ContainerCreating|Terminating|Progressing|^0\//.test(s)) return 'warn'
+  if (/Running|Ready$|Active|Bound|Running$/.test(s)) return 'ok'
   return ''
 }
 
@@ -58,6 +103,12 @@ function age(ts?: string): string {
   return `${Math.floor(s / 86400)}d`
 }
 
+function friendlyError(raw: string): string {
+  // kubectl stderr is verbose — keep the actionable line(s).
+  const lines = raw.split('\n').filter((l) => !/memcache|Unhandled Error|at /.test(l) && l.trim())
+  return lines.slice(-4).join('\n') || raw
+}
+
 export default function App(): React.JSX.Element {
   const [contexts, setContexts] = useState<string[]>([])
   const [context, setContext] = useState('')
@@ -65,13 +116,16 @@ export default function App(): React.JSX.Element {
   const [namespace, setNamespace] = useState('default')
   const [kind, setKind] = useState('pods')
   const [items, setItems] = useState<K8sObject[]>([])
+  const [query, setQuery] = useState('')
+  const [autoRefresh, setAutoRefresh] = useState(false)
   const [selected, setSelected] = useState<K8sObject | null>(null)
   const [detail, setDetail] = useState('')
   const [detailTab, setDetailTab] = useState<'describe' | 'logs'>('describe')
+  const [logContainer, setLogContainer] = useState('')
+  const [logPrevious, setLogPrevious] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
-  // Load contexts once.
   useEffect(() => {
     window.k8s
       .listContexts()
@@ -80,17 +134,14 @@ export default function App(): React.JSX.Element {
         const cur = await window.k8s.currentContext().catch(() => '')
         setContext(cur || ctxs[0] || '')
       })
-      .catch((e) => setError(`Cannot reach kubectl: ${String(e)}`))
+      .catch((e) => setError(`Cannot reach kubectl: ${friendlyError(String(e))}`))
   }, [])
 
-  // Load namespaces when context changes.
   useEffect(() => {
     if (!context) return
     window.k8s
       .list({ context, kind: 'namespaces' })
-      .then((list) =>
-        setNamespaces((list as K8sList).items.map((i) => i.metadata.name))
-      )
+      .then((list) => setNamespaces((list as K8sList).items.map((i) => i.metadata.name)))
       .catch(() => setNamespaces([]))
   }, [context])
 
@@ -98,47 +149,80 @@ export default function App(): React.JSX.Element {
     if (!context) return
     setLoading(true)
     setError('')
-    setSelected(null)
-    setDetail('')
-    const clusterScoped = kind === 'nodes' || kind === 'namespaces'
     window.k8s
-      .list({ context, namespace: clusterScoped ? undefined : namespace, kind })
+      .list({
+        context,
+        namespace: CLUSTER_SCOPED.has(kind) ? undefined : namespace,
+        kind
+      })
       .then((list) => setItems((list as K8sList).items))
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(friendlyError(String(e))))
       .finally(() => setLoading(false))
   }, [context, namespace, kind])
 
   useEffect(() => {
-    loadResources()
+    const t = setTimeout(loadResources, 0)
+    return () => clearTimeout(t)
   }, [loadResources])
 
-  // Load detail when selection or tab changes.
+  // Auto-refresh every 15s when enabled.
+  useEffect(() => {
+    if (!autoRefresh) return
+    const t = setInterval(loadResources, 15_000)
+    return () => clearInterval(t)
+  }, [autoRefresh, loadResources])
+
+  // Detail panel — kind is plural; kubectl accepts plurals natively.
   useEffect(() => {
     if (!selected || !context) return
     const name = selected.metadata.name
     const ns = selected.metadata.namespace
-    setDetail('Loading…')
     if (detailTab === 'logs' && kind === 'pods') {
       window.k8s
-        .logs({ context, namespace: ns ?? namespace, pod: name })
+        .logs({
+          context,
+          namespace: ns ?? namespace,
+          pod: name,
+          container: logContainer || undefined,
+          previous: logPrevious
+        })
         .then(setDetail)
-        .catch((e) => setDetail(`Error: ${String(e)}`))
+        .catch((e) => setDetail(`Error: ${friendlyError(String(e))}`))
     } else {
       window.k8s
-        .describe({ context, namespace: ns, kind: kind.replace(/s$/, ''), name })
+        .describe({ context, namespace: ns, kind, name })
         .then(setDetail)
-        .catch((e) => setDetail(`Error: ${String(e)}`))
+        .catch((e) => setDetail(`Error: ${friendlyError(String(e))}`))
     }
-  }, [selected, detailTab, context, kind, namespace])
+  }, [selected, detailTab, context, kind, namespace, logContainer, logPrevious])
 
-  const rows = useMemo(() => items, [items])
+  const rows = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return items
+    return items.filter(
+      (i) =>
+        i.metadata.name.toLowerCase().includes(q) ||
+        (i.metadata.namespace ?? '').toLowerCase().includes(q) ||
+        podStatus(i).toLowerCase().includes(q)
+    )
+  }, [items, query])
+
+  const isPod = kind === 'pods'
+  const containers = selected && isPod ? containerNames(selected) : []
 
   return (
     <div className="shell">
       <aside className="sidebar">
         <div className="brand">K8s Desktop</div>
         <label className="lbl">Context</label>
-        <select value={context} onChange={(e) => setContext(e.target.value)}>
+        <select
+          value={context}
+          onChange={(e) => {
+            setContext(e.target.value)
+            setSelected(null)
+            setDetail('')
+          }}
+        >
           {contexts.map((c) => (
             <option key={c} value={c}>
               {c}
@@ -146,7 +230,14 @@ export default function App(): React.JSX.Element {
           ))}
         </select>
         <label className="lbl">Namespace</label>
-        <select value={namespace} onChange={(e) => setNamespace(e.target.value)}>
+        <select
+          value={namespace}
+          onChange={(e) => {
+            setNamespace(e.target.value)
+            setSelected(null)
+            setDetail('')
+          }}
+        >
           {namespaces.map((n) => (
             <option key={n} value={n}>
               {n}
@@ -158,7 +249,11 @@ export default function App(): React.JSX.Element {
             <button
               key={k.id}
               className={k.id === kind ? 'active' : ''}
-              onClick={() => setKind(k.id)}
+              onClick={() => {
+                setKind(k.id)
+                setSelected(null)
+                setDetail('')
+              }}
             >
               {k.label}
             </button>
@@ -172,12 +267,28 @@ export default function App(): React.JSX.Element {
           <h1>
             {KINDS.find((k) => k.id === kind)?.label}
             <span className="ns">
-              {kind === 'nodes' || kind === 'events' ? ' all namespaces' : ` · ${namespace}`}
+              {CLUSTER_SCOPED.has(kind) ? ' cluster-scoped' : ` · ${namespace}`}
             </span>
           </h1>
-          <button className="refresh" onClick={loadResources} disabled={loading}>
-            {loading ? 'Loading…' : 'Refresh'}
-          </button>
+          <div className="head-actions">
+            <input
+              className="search"
+              placeholder="Filter…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+            <label className="auto">
+              <input
+                type="checkbox"
+                checked={autoRefresh}
+                onChange={(e) => setAutoRefresh(e.target.checked)}
+              />
+              15s
+            </label>
+            <button className="refresh" onClick={loadResources} disabled={loading}>
+              {loading ? 'Loading…' : 'Refresh'}
+            </button>
+          </div>
         </header>
 
         {error && <div className="error">{error}</div>}
@@ -187,8 +298,9 @@ export default function App(): React.JSX.Element {
             <thead>
               <tr>
                 <th>Name</th>
-                {kind !== 'nodes' && <th>Namespace</th>}
+                {!CLUSTER_SCOPED.has(kind) && <th>Namespace</th>}
                 <th>Status</th>
+                {isPod && <th>Restarts</th>}
                 <th>Age</th>
               </tr>
             </thead>
@@ -196,6 +308,7 @@ export default function App(): React.JSX.Element {
               {rows.map((it) => {
                 const st = podStatus(it)
                 const sel = selected?.metadata.name === it.metadata.name
+                const restarts = restartCount(it)
                 return (
                   <tr
                     key={`${it.metadata.namespace}/${it.metadata.name}`}
@@ -203,21 +316,25 @@ export default function App(): React.JSX.Element {
                     onClick={() => {
                       setSelected(it)
                       setDetailTab('describe')
+                      setLogContainer('')
+                      setLogPrevious(false)
+                      setDetail('Loading…')
                     }}
                   >
                     <td className="mono">{it.metadata.name}</td>
-                    {kind !== 'nodes' && <td>{it.metadata.namespace ?? '—'}</td>}
+                    {!CLUSTER_SCOPED.has(kind) && <td>{it.metadata.namespace ?? '—'}</td>}
                     <td>
                       <span className={`pill ${statusClass(st)}`}>{st}</span>
                     </td>
+                    {isPod && <td className={restarts > 0 ? 'warn-text' : ''}>{restarts}</td>}
                     <td>{age(it.metadata.creationTimestamp)}</td>
                   </tr>
                 )
               })}
               {!loading && rows.length === 0 && (
                 <tr>
-                  <td colSpan={4} className="empty">
-                    No {kind} found.
+                  <td colSpan={5} className="empty">
+                    {query ? `No ${kind} matching "${query}".` : `No ${kind} found.`}
                   </td>
                 </tr>
               )}
@@ -234,19 +351,45 @@ export default function App(): React.JSX.Element {
               <div className="tabs">
                 <button
                   className={detailTab === 'describe' ? 'active' : ''}
-                  onClick={() => setDetailTab('describe')}
+                  onClick={() => {
+                    setDetailTab('describe')
+                    setDetail('Loading…')
+                  }}
                 >
                   Describe
                 </button>
-                {kind === 'pods' && (
+                {isPod && (
                   <button
                     className={detailTab === 'logs' ? 'active' : ''}
-                    onClick={() => setDetailTab('logs')}
+                    onClick={() => {
+                      setDetailTab('logs')
+                      setDetail('Loading…')
+                    }}
                   >
                     Logs
                   </button>
                 )}
               </div>
+              {detailTab === 'logs' && isPod && (
+                <div className="log-opts">
+                  <select value={logContainer} onChange={(e) => setLogContainer(e.target.value)}>
+                    <option value="">all containers</option>
+                    {containers.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                  <label className="auto">
+                    <input
+                      type="checkbox"
+                      checked={logPrevious}
+                      onChange={(e) => setLogPrevious(e.target.checked)}
+                    />
+                    --previous
+                  </label>
+                </div>
+              )}
             </div>
             <button className="close" onClick={() => setSelected(null)}>
               ×

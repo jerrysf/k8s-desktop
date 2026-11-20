@@ -16,6 +16,7 @@ const api = {
     namespace: string
     pod: string
     container?: string
+    previous?: boolean
   }): Promise<string> => ipcRenderer.invoke('k8s:logs', args),
   describe: (args: {
     context: string

@@ -37,10 +37,19 @@ function assertContext(context: string): void {
   }
 }
 
+function assertName(name: string): void {
+  if (typeof name !== 'string' || !name || name.startsWith('-')) {
+    throw new Error('invalid resource name')
+  }
+}
+
 function registerIpc(): void {
   ipcMain.handle('k8s:contexts', async () => {
     const out = await kubectlText(['config', 'get-contexts', '-o', 'name'])
-    return out.split('\n').map((s) => s.trim()).filter(Boolean)
+    return out
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean)
   })
 
   ipcMain.handle('k8s:currentContext', async () => {
@@ -61,19 +70,27 @@ function registerIpc(): void {
 
   ipcMain.handle(
     'k8s:logs',
-    async (_e, args: { context: string; namespace: string; pod: string; container?: string }) => {
+    async (
+      _e,
+      args: {
+        context: string
+        namespace: string
+        pod: string
+        container?: string
+        previous?: boolean
+      }
+    ) => {
       assertContext(args.context)
-      const cmd = [
-        'logs',
-        args.pod,
-        '-n',
-        args.namespace,
-        '--context',
-        args.context,
-        '--tail=500',
-        '--all-containers=true'
-      ]
-      if (args.container) cmd.push('-c', args.container)
+      assertName(args.pod)
+      assertName(args.namespace)
+      const cmd = ['logs', args.pod, '-n', args.namespace, '--context', args.context, '--tail=500']
+      if (args.container) {
+        assertName(args.container)
+        cmd.push('-c', args.container)
+      } else {
+        cmd.push('--all-containers=true')
+      }
+      if (args.previous) cmd.push('--previous')
       return kubectlText(cmd)
     }
   )
@@ -83,6 +100,7 @@ function registerIpc(): void {
     async (_e, args: { context: string; namespace?: string; kind: string; name: string }) => {
       assertContext(args.context)
       assertKind(args.kind)
+      assertName(args.name)
       const cmd = ['describe', args.kind, args.name, '--context', args.context]
       if (args.namespace) cmd.push('-n', args.namespace)
       return kubectlText(cmd)
